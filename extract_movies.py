@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SpencerDev Live M3U8 Extractor - ALL SERVERS
-Uses curl_cffi Chrome impersonation to bypass datacenter IP blocks
+Uses curl_cffi Chrome impersonation + rotating residential proxies
 """
 
 import argparse
@@ -27,6 +27,21 @@ except ImportError:
 
 SERVER_CODES = [25, 24, 1, 23, 22]
 
+PROXIES = [
+    {"ip": "31.59.20.176",    "port": "6754"},
+    {"ip": "31.56.127.193",   "port": "7684"},
+    {"ip": "45.38.107.97",    "port": "6014"},
+    {"ip": "38.154.203.95",   "port": "5863"},
+    {"ip": "198.105.121.200", "port": "6462"},
+    {"ip": "64.137.96.74",    "port": "6641"},
+    {"ip": "198.23.243.226",  "port": "6361"},
+    {"ip": "38.154.185.97",   "port": "6370"},
+    {"ip": "142.111.67.146",  "port": "5611"},
+    {"ip": "191.96.254.138",  "port": "6185"},
+]
+PROXY_USER = "ygxmhkcc"
+PROXY_PASS = "n3batopqanpg"
+
 EXTRA_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -38,6 +53,34 @@ EXTRA_HEADERS = {
 }
 
 
+def make_proxy_url(p: dict) -> str:
+    return f"http://{PROXY_USER}:{PROXY_PASS}@{p['ip']}:{p['port']}"
+
+
+def make_session(proxy_url: str) -> cffi_requests.Session:
+    session = cffi_requests.Session(impersonate="chrome120")
+    session.proxies = {"http": proxy_url, "https": proxy_url}
+    return session
+
+
+def get_working_session() -> tuple[cffi_requests.Session, str] | tuple[None, None]:
+    """Try each proxy until one successfully hits the homepage."""
+    for p in PROXIES:
+        proxy_url = make_proxy_url(p)
+        label = f"{p['ip']}:{p['port']}"
+        try:
+            session = make_session(proxy_url)
+            resp = session.get("https://spencerdevs.xyz/", headers=EXTRA_HEADERS, timeout=10)
+            if resp.status_code < 500:
+                print(f"   ✅ Proxy working: {label}")
+                return session, label
+            else:
+                print(f"   ✗ {label} → {resp.status_code}")
+        except Exception as e:
+            print(f"   ✗ {label} → {e}")
+    return None, None
+
+
 def snoopdog_to_url(snoopdog: str) -> str | None:
     try:
         BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
@@ -47,9 +90,9 @@ def snoopdog_to_url(snoopdog: str) -> str | None:
         encoded = "".join(SNOOPDOG_TABLE.get(token, "") for token in snoopdog.strip().split())
         payload = base64.b64decode(encoded + "=" * (-len(encoded) % 4))
 
-        password = payload[:32]
-        salt     = payload[32:48]
-        iv       = payload[48:64]
+        password  = payload[:32]
+        salt      = payload[32:48]
+        iv        = payload[48:64]
         ciphertext = payload[64:]
 
         key = hashlib.pbkdf2_hmac("sha512", password, salt, 100000, dklen=32)
@@ -65,16 +108,28 @@ def snoopdog_to_url(snoopdog: str) -> str | None:
         return None
 
 
-def extract_all_m3u8(movie_id: str):
-    session = cffi_requests.Session(impersonate="chrome120")
+def fetch_with_fallback(url: str) -> dict | None:
+    """Try each proxy until we get a 200 JSON response."""
+    for p in PROXIES:
+        proxy_url = make_proxy_url(p)
+        label = f"{p['ip']}:{p['port']}"
+        try:
+            session = make_session(proxy_url)
+            resp = session.get(url, headers=EXTRA_HEADERS, timeout=12)
+            if resp.status_code == 200:
+                return resp.json()
+            print(f"      proxy {label} → {resp.status_code}, trying next...")
+        except Exception as e:
+            print(f"      proxy {label} → error: {e}, trying next...")
+        time.sleep(0.3)
+    return None
 
-    # Warm-up: visit homepage to pick up cookies
-    print("🌐 Warming up session...")
-    try:
-        session.get("https://spencerdevs.xyz/", headers=EXTRA_HEADERS, timeout=12)
-        time.sleep(1)
-    except Exception:
-        pass
+
+def extract_all_m3u8(movie_id: str):
+    print("🌐 Finding working proxy...")
+    session, active_proxy = get_working_session()
+    if session is None:
+        print("❌ All proxies failed on warm-up. Continuing anyway...")
 
     print(f"\n🌐 Processing movie: {movie_id}")
     all_links = []
@@ -83,36 +138,39 @@ def extract_all_m3u8(movie_id: str):
         server_url = f"https://servers.spencerdevs.xyz/{code}/m/{movie_id}"
         print(f"\n🔍 Server {code} → {server_url}")
 
-        try:
-            resp = session.get(server_url, headers=EXTRA_HEADERS, timeout=12)
-            print(f"   └─ Status: {resp.status_code}")
-
-            if resp.status_code == 403:
-                print("   └─ 403 Forbidden (IP/TLS blocked)")
-                continue
-            if resp.status_code != 200:
-                print(f"   └─ Failed ({resp.status_code})")
-                continue
-
+        # Try active session first, fall back to proxy rotation per request
+        data = None
+        if session:
             try:
-                data = resp.json()
-            except Exception:
-                print(f"   └─ Non-JSON: {resp.text[:120]}")
-                continue
-
-            if "snoopdog" in data:
-                print("   └─ Snoopdog found → Decrypting...")
-                m3u8_url = snoopdog_to_url(data["snoopdog"])
-                if m3u8_url and m3u8_url.startswith("http"):
-                    print(f"   ✅ {m3u8_url}")
-                    all_links.append(m3u8_url)
+                resp = session.get(server_url, headers=EXTRA_HEADERS, timeout=12)
+                print(f"   └─ Status: {resp.status_code}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                elif resp.status_code in (403, 429):
+                    print("   └─ Blocked, trying proxy rotation...")
+                    data = fetch_with_fallback(server_url)
                 else:
-                    print("   └─ Decryption produced invalid URL")
-            else:
-                print(f"   └─ No snoopdog key. Keys: {list(data.keys())}")
+                    print(f"   └─ Failed ({resp.status_code})")
+            except Exception as e:
+                print(f"   └─ Session error: {e}, trying proxy rotation...")
+                data = fetch_with_fallback(server_url)
+        else:
+            data = fetch_with_fallback(server_url)
 
-        except Exception as e:
-            print(f"   └─ Error: {e}")
+        if data is None:
+            print("   └─ All proxies exhausted for this server")
+            continue
+
+        if "snoopdog" in data:
+            print("   └─ Snoopdog found → Decrypting...")
+            m3u8_url = snoopdog_to_url(data["snoopdog"])
+            if m3u8_url and m3u8_url.startswith("http"):
+                print(f"   ✅ {m3u8_url}")
+                all_links.append(m3u8_url)
+            else:
+                print("   └─ Decryption produced invalid URL")
+        else:
+            print(f"   └─ No snoopdog key. Keys: {list(data.keys())}")
 
         time.sleep(0.5)
 
